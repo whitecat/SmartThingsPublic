@@ -17,19 +17,25 @@
  */
 
 metadata {
-	definition (name: "Z-Wave Motion Sensor", namespace: "smartthings", author: "SmartThings", ocfDeviceType: "x.com.st.d.sensor.motion", runLocally: true, minHubCoreVersion: '000.017.0012', executeCommandsLocally: false) {
+	definition (name: "Z-Wave Motion Sensor", namespace: "smartthings", author: "SmartThings", ocfDeviceType: "x.com.st.d.sensor.motion", runLocally: true, minHubCoreVersion: '000.017.0012', executeCommandsLocally: false, genericHandler: "Z-Wave") {
 		capability "Motion Sensor"
 		capability "Sensor"
 		capability "Battery"
 		capability "Health Check"
+		capability "Tamper Alert"
 
 		fingerprint mfr: "011F", prod: "0001", model: "0001", deviceJoinName: "Schlage Motion Sensor"  // Schlage motion
 		fingerprint mfr: "014A", prod: "0001", model: "0001", deviceJoinName: "Ecolink Motion Sensor"  // Ecolink motion
 		fingerprint mfr: "014A", prod: "0004", model: "0001", deviceJoinName: "Ecolink Motion Sensor"  // Ecolink motion +
 		fingerprint mfr: "0060", prod: "0001", model: "0002", deviceJoinName: "Everspring Motion Sensor"  // Everspring SP814
 		fingerprint mfr: "0060", prod: "0001", model: "0003", deviceJoinName: "Everspring Motion Sensor"  // Everspring HSP02
+		fingerprint mfr: "0060", prod: "0001", model: "0005", deviceJoinName: "Everspring Motion Detector" //Everspring SP817
+		fingerprint mfr: "0060", prod: "0001", model: "0006", deviceJoinName: "Everspring Motion Detector"
 		fingerprint mfr: "011A", prod: "0601", model: "0901", deviceJoinName: "Enerwave Motion Sensor"  // Enerwave ZWN-BPC
 		fingerprint mfr: "0063", prod: "4953", model: "3133", deviceJoinName: "GE Portable Smart Motion Sensor"
+		fingerprint mfr: "0214", prod: "0003", model: "0002", deviceJoinName: "BeSense Motion Detector"
+		fingerprint mfr: "027A", prod: "0001", model: "0005", deviceJoinName: "Zooz Outdoor Motion Sensor"
+		fingerprint mfr: "027A", prod: "0301", model: "0012", deviceJoinName: "Zooz Motion Sensor", mnmn: "SmartThings", vid: "generic-motion-2"
 	}
 
 	simulator {
@@ -47,15 +53,20 @@ metadata {
 		valueTile("battery", "device.battery", inactiveLabel: false, decoration: "flat", width: 2, height: 2) {
 			state("battery", label:'${currentValue}% battery', unit:"")
 		}
+		valueTile("tamper", "device.tamper", height: 2, width: 2, decoration: "flat") {
+			state "clear", label: 'tamper clear', backgroundColor: "#ffffff"
+			state "detected", label: 'tampered', backgroundColor: "#ff0000"
+		}
 
 		main "motion"
-		details(["motion", "battery"])
+		details(["motion", "battery", "tamper"])
 	}
 }
 
 def installed() {
 // Device wakes up every 4 hours, this interval allows us to miss one wakeup notification before marking offline
 	sendEvent(name: "checkInterval", value: 8 * 60 * 60 + 2 * 60, displayed: false, data: [protocol: "zwave", hubHardwareId: device.hub.hardwareID])
+	sendEvent(name: "tamper", value: "clear", displayed: false)
 	response(initialPoll())
 }
 
@@ -87,6 +98,7 @@ def sensorValueEvent(value) {
 	if (value) {
 		createEvent(name: "motion", value: "active", descriptionText: "$device.displayName detected motion")
 	} else {
+		createEvent(name: "tamper", value: "clear")
 		createEvent(name: "motion", value: "inactive", descriptionText: "$device.displayName motion has stopped")
 	}
 }
@@ -129,6 +141,8 @@ def zwaveEvent(physicalgraph.zwave.commands.notificationv3.NotificationReport cm
 		} else if (cmd.event == 0x03) {
 			result << createEvent(name: "tamper", value: "detected", descriptionText: "$device.displayName covering was removed", isStateChange: true)
 			result << response(zwave.batteryV1.batteryGet())
+			unschedule(clearTamper, [forceForLocallyExecuting: true])
+			runIn(10, clearTamper, [forceForLocallyExecuting: true])
 		} else if (cmd.event == 0x05 || cmd.event == 0x06) {
 			result << createEvent(descriptionText: "$device.displayName detected glass breakage", isStateChange: true)
 		}
@@ -142,40 +156,22 @@ def zwaveEvent(physicalgraph.zwave.commands.notificationv3.NotificationReport cm
 	result
 }
 
-def zwaveEvent(physicalgraph.zwave.commands.associationv2.AssociationReport cmd) {
-	def result = []
-
-	if (cmd.groupingIdentifier == 1) {
-		if (cmd.nodeId.any { it == zwaveHubNodeId }) {
-			state.group1Assoc = true
-			result << createEvent(descriptionText: "$device.displayName is associated in group ${cmd.groupingIdentifier}", isStateChange: false)
-		} else {
-			result << createEvent(descriptionText: "Associating $device.displayName in group ${cmd.groupingIdentifier}", isStateChange: false)
-			result << response(zwave.associationV1.associationSet(groupingIdentifier:1, nodeId:zwaveHubNodeId))
-		}
-	}
-	result << decrWakeUpRequestRefCount()
-
-	result
+def clearTamper() {
+	sendEvent(name: "tamper", value: "clear")
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.wakeupv1.WakeUpNotification cmd)
 {
 	def result = [createEvent(descriptionText: "${device.displayName} woke up", isStateChange: false)]
 
-	incrWakeUpRequestRefCount(true)
-
-	if (isEnerwave() && !state.group1Assoc) {  // Enerwave motion doesn't always get the associationSet that the hub sends on join, so check and re-send if needed
-		result << response(zwave.associationV1.associationGet())
-		incrWakeUpRequestRefCount()
+	if (isEnerwave() && device.currentState('motion') == null) {  // Enerwave motion doesn't always get the associationSet that the hub sends on join
+		result << response(zwave.associationV1.associationSet(groupingIdentifier:1, nodeId:zwaveHubNodeId))
 	}
 	if (!state.lastbat || (new Date().time) - state.lastbat > 53*60*60*1000) {
 		result << response(zwave.batteryV1.batteryGet())
-		incrWakeUpRequestRefCount()
+	} else {
+		result << response(zwave.wakeUpV1.wakeUpNoMoreInformation())
 	}
-
-	result << decrWakeUpRequestRefCount()
-
 	result
 }
 
@@ -189,8 +185,7 @@ def zwaveEvent(physicalgraph.zwave.commands.batteryv1.BatteryReport cmd) {
 		map.value = cmd.batteryLevel
 	}
 	state.lastbat = new Date().time
-
-	[createEvent(map), decrWakeUpRequestRefCount()]
+	[createEvent(map), response(zwave.wakeUpV1.wakeUpNoMoreInformation())]
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.sensormultilevelv5.SensorMultilevelReport cmd)
@@ -278,10 +273,12 @@ def initialPoll() {
 	}
 	request << zwave.batteryV1.batteryGet()
 	request << zwave.sensorBinaryV2.sensorBinaryGet(sensorType: 0x0C) //motion
+	request << zwave.notificationV3.notificationGet(notificationType: 0x07, event: 0x08) //motion for Everspiring
 	commands(request) + ["delay 20000", zwave.wakeUpV1.wakeUpNoMoreInformation().format()]
 }
 
 private commands(commands, delay=200) {
+	log.info "sending commands: ${commands}"
 	delayBetween(commands.collect{ command(it) }, delay)
 }
 
@@ -297,46 +294,4 @@ private command(physicalgraph.zwave.Command cmd) {
 
 private isEnerwave() {
 	zwaveInfo?.mfr?.equals("011A") && zwaveInfo?.prod?.equals("0601") && zwaveInfo?.model?.equals("0901")
-}
-
-/**
- * Increment the ref count of requests made from WakeUpNotification.
- *
- * @param initial If set to true reset the ref count. Should only be set to true in the first call in
- *                WakeUpNotification to avoid the chance that a WakeUpNotification arrived right before
- *                we sent the first WakeUpNoMoreInformation (to which the device would promptly go back
- *                to sleep and never receive nor respond to our second set of requests, leaving ref count > 0..
- *
- */
-private incrWakeUpRequestRefCount(Boolean initial = false) {
-	if (state.wakeUpRequestRefCount == null || initial) {
-		state.wakeUpRequestRefCount = 0
-	}
-
-	state.wakeUpRequestRefCount = state.wakeUpRequestRefCount + 1
-}
-
-/**
- * Decrement the ref count of requests made from WakeUpNotification.
- *
- * @return This function will return a valid HubAction object containing either an empty action when
- *         ref count > 0, or a valid HubAction containing a WakeUpNoMoreInformation when ref count < 1.
- *
- */
-private decrWakeUpRequestRefCount() {
-	def result = response("")
-
-	if (state.wakeUpRequestRefCount == null) {
-		state.wakeUpRequestRefCount = 0 // Uh oh, someone was naughty, but we guarentee a wakeUpNoMoreInfo if refCount < 1, so give them what they want
-	}
-
-	state.wakeUpRequestRefCount = state.wakeUpRequestRefCount - 1
-
-	if (state.wakeUpRequestRefCount < 1) {
-		state.wakeUpRequestRefCount = 0
-
-		result = response(zwave.wakeUpV1.wakeUpNoMoreInformation())
-	}
-
-	result
 }

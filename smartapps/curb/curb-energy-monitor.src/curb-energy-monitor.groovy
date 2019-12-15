@@ -30,6 +30,7 @@ definition(
 ) {
     appSetting "clientId"
     appSetting "clientSecret"
+    appSetting "serverUrl"
 }
 
 preferences {
@@ -45,6 +46,20 @@ mappings {
     path("/oauth/callback") {
         action: [GET: "callback"]
     }
+}
+
+def getCurbAuthUrl() { return "https://energycurb.auth0.com" }
+
+def getCurbLoginUrl() { return "${curbAuthUrl}/authorize" }
+
+def getCurbTokenUrl() { return "${curbAuthUrl}/oauth/token" }
+
+def getServerUrl() { return  appSettings.serverUrl ?: apiServerUrl }
+
+def getCallbackUrl() { return "${serverUrl}/oauth/callback" }
+
+def getBuildRedirectUrl() {
+  return "${serverUrl}/oauth/initialize?appId=${app.id}&access_token=${state.accessToken}&apiServerUrl=${serverUrl}"
 }
 
 def installed() {
@@ -66,10 +81,14 @@ def initialize() {
 
     def curbCircuits = getCurbCircuits()
     log.debug "Found devices: ${curbCircuits}"
-
+    log.debug settings
     runEvery1Minute(getPowerData)
-    runEvery1Hour(getKwhData)
-
+    if (settings.energyInterval=="Hour" || settings.energyInterval == "Half Hour" || settings.energyInterval == "Fifteen Minutes")
+    {
+      runEvery1Minute(getKwhData)
+    } else {
+      runEvery1Hour(getKwhData)
+    }
 }
 
 def uninstalled() {
@@ -95,6 +114,13 @@ def authPage() {
                     options: state.locations
 
                 )
+                input(
+                  name: "energyInterval",
+                  type: "enum",
+                  title: "Energy Interval",
+                  options: ["Billing Period", "Day", "Hour", "Half Hour", "Fifteen Minutes"],
+                  defaultValue: "Hour"
+                  )
             }
         }
     } else {
@@ -137,22 +163,17 @@ def callback() {
             client_secret: appSettings.clientSecret,
             redirect_uri: callbackUrl
         ]
-        httpPostJson([uri: curbTokenUrl, body: tokenParams]) {
-            resp ->
 
-              state.refreshToken = resp.data.refresh_token
-              state.authToken = resp.data.access_token
-        }
-        if (state.authToken) {
-            success()
-        } else {
-            fail()
-        }
+        asynchttp_v1.post(handleTokenResponse, [uri: curbTokenUrl, body: tokenParams])
+        success()
     } else {
-
         log.error "callback() failed oauthState != state.oauthInitState"
-
     }
+}
+
+def handleTokenResponse(resp, data){
+	state.refreshToken = resp.json.refresh_token
+    state.authToken = resp.json.access_token
 }
 
 private removeChildDevices(delete) {
@@ -192,7 +213,7 @@ def getCurbLocations() {
             resp ->
             resp.data.each {
                 log.debug "Found location: ${it}"
-                allLocations[it.id] = it.name
+                allLocations[it.id] = it.label
             }
             state.locations = allLocations
         }
@@ -222,9 +243,17 @@ def getPowerData(create=false) {
 
 def getKwhData() {
   log.debug "Getting kwh data at ${settings.curbLocation} with token: ${state.authToken}"
+  def url = "/api/aggregate/${settings.curbLocation}/"
+
+  if (settings.energyInterval == "Hour"){ url = url + "1h/m"}
+  if (settings.energyInterval == "Billing Period"){ url = url + "billing/h"}
+  if (settings.energyInterval == "Half Hour"){ url = url + "30m/m"}
+  if (settings.energyInterval == "Day"){ url = url + "24h/h"}
+  if (settings.energyInterval == "Fifteen Minutes"){ url = url + "15m/m"}
+	log.debug "KWH FOR: ${url}"
     def params = [
         uri: "https://app.energycurb.com",
-        path: "/api/aggregate/${settings.curbLocation}/billing/h",
+        path: url,
         headers: ["Authorization": "Bearer ${state.authToken}"],
         requestContentType: 'application/json'
     ]
@@ -264,7 +293,7 @@ def processData(resp, data, create=false, energy=false)
         	all += numValue
             if (!it.main && !it.production && it.label != null && it.label != "") {
             	if (create) { createChildDevice("${it.id}", "${it.label}") }
-                energy ?  getChildDevice("${it.id}")?.handleKwhBilling(numValue) : updateChildDevice("${it.id}", numValue)
+                energy ?  getChildDevice("${it.id}")?.handleKwhBilling(numValue.floatValue()) : updateChildDevice("${it.id}", numValue)
             }
             if (it.grid) {
               hasMains = true
@@ -417,30 +446,4 @@ def connectionStatus(message, redirectUrl = null) {
 
 def isOK(response) {
   response.status in [200, 201]
-}
-
-def getCurbAuthUrl() {
-    return "https://energycurb.auth0.com"
-}
-def getCurbLoginUrl() {
-    return "${curbAuthUrl}/authorize"
-}
-def getCurbTokenUrl() {
-    return "${curbAuthUrl}/oauth/token"
-}
-def getServerUrl() {
-    return "https://graph.api.smartthings.com"
-}
-def getShardUrl() {
-    return getApiServerUrl()
-}
-def getCallbackUrl() {
-    return "https://graph.api.smartthings.com/oauth/callback"
-}
-def getBuildRedirectUrl() {
-
-    return "${serverUrl}/oauth/initialize?appId=${app.id}&access_token=${state.accessToken}&apiServerUrl=${shardUrl}"
-}
-def getApiEndpoint() {
-    return "https://api.energycurb.com"
 }
